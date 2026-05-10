@@ -172,26 +172,33 @@ class ZeroOrderOptimizer:
         # STUDENT: Replace or extend the gradient estimation below.
         # ------------------------------------------------------------------
         grads: dict[str, torch.Tensor] = {}
-
         with torch.no_grad():
+            # Generate one random direction for each parameter
+            directions = {}
             for name, param in params.items():
-                u = self._sample_direction(param)
+                directions[name] = self._sample_direction(param)
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+            # f(θ + ε·u) shift all the parameters at once
+            for name, param in params.items():
+                param.data.add_(self.eps * directions[name])
+            f_plus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+            # f(θ - ε·u) shift on the other side
+            for name, param in params.items():
+                param.data.sub_(2.0 * self.eps * directions[name])
+            f_minus = loss_fn()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+            # Restoring the original values
+            for name, param in params.items():
+                param.data.add_(self.eps * directions[name])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+            # One scalar scale for all parameters
+            scale = (f_plus - f_minus) / (2.0 * self.eps)
+            for name in params:
+                grads[name] = scale * directions[name]
 
         return grads
+
         # ------------------------------------------------------------------
 
     def _update_params(

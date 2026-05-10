@@ -32,6 +32,7 @@ def init_last_layer(layer: nn.Linear) -> None:
     # -------------------------------------------------------------------------
     # STUDENT: Replace or extend the initialization below.
     # -------------------------------------------------------------------------
-    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+    nn.init.orthogonal_(layer.weight)
+    with torch.no_grad():
+        layer.weight.data *= 0.05
     nn.init.zeros_(layer.bias)
-    # -------------------------------------------------------------------------

@@ -91,15 +91,11 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
 
     def _init_prototypes(self):
-        """Initialize fc using ridge regression on frozen backbone features.
+        """Initialize fc via ridge regression with hyperparameter search.
 
-        Centroids (mean feature per class) gave ~50%. Ridge regression
-        solves for the optimal linear head analytically:
-            W* = (X^T X + λI)^{-1} X^T Y
-        This is equivalent to linear probing in closed form.
-
-        Accumulates X^T X and X^T Y incrementally to avoid storing all
-        50000 feature vectors in memory.
+        Searches over regularization strength lambda and temperature
+        scaling to find the best linear head for the frozen backbone.
+        Previous: lambda=1.0, temp=10 gave 61.79%.
         """
         import torchvision.datasets as datasets
         import torchvision.transforms as T
@@ -117,45 +113,82 @@ class ZeroOrderOptimizer:
             T.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
         ])
 
-        dataset = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform)
+        dataset = datasets.CIFAR100(
+            root="./data", train=True, download=True, transform=transform
+        )
         loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=0)
 
         feat_dim = self.model.fc.in_features
         num_classes = 100
 
-        XtX,XtY  = torch.zeros(feat_dim, feat_dim, device=device), torch.zeros(feat_dim, num_classes, device=device)
-        Ysum,Xsum = torch.zeros(num_classes, device=device), torch.zeros(feat_dim, device=device)
-        n_total = 0
+        # Collect all features and labels for hyperparameter search
+        all_feats = []
+        all_labels = []
+        XtX = torch.zeros(feat_dim, feat_dim, device=device)
+        XtY = torch.zeros(feat_dim, num_classes, device=device)
 
         with torch.no_grad():
             for images, labels in loader:
-                images,labels = images.to(device), labels.to(device)
-                feats = backbone(images).flatten(1) 
+                images = images.to(device)
+                labels = labels.to(device)
+                feats = backbone(images).flatten(1)
 
                 Y_onehot = torch.zeros(feats.size(0), num_classes, device=device)
                 Y_onehot.scatter_(1, labels.unsqueeze(1), 1.0)
 
                 XtX.addmm_(feats.T, feats)
                 XtY.addmm_(feats.T, Y_onehot)
-                Xsum.add_(feats.sum(dim=0))
-                Ysum.add_(Y_onehot.sum(dim=0))
-                n_total += feats.size(0)
 
-        lambda_reg = 1.0
-        W = torch.linalg.solve(XtX + lambda_reg * torch.eye(feat_dim, device=device),XtY) 
+                all_feats.append(feats)
+                all_labels.append(labels)
 
-        X_mean = Xsum / n_total
-        Y_mean = Ysum / n_total
-        bias = Y_mean - X_mean @ W  
+        X = torch.cat(all_feats, dim=0)    # [50000, 512]
+        y = torch.cat(all_labels, dim=0)   # [50000]
 
-        temp = 10.0
-        W = W * temp
-        bias = bias * temp
+        I = torch.eye(feat_dim, device=device)
+
+        # Search lambda: different values change W direction, affecting accuracy
+        best_train_acc = 0.0
+        best_W = None
+
+        for lam in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
+            W = torch.linalg.solve(XtX + lam * I, XtY)  # [512, 100]
+            preds = (X @ W).argmax(dim=1)
+            acc = (preds == y).float().mean().item()
+            if acc > best_train_acc:
+                best_train_acc = acc
+                best_W = W
+
+        # Search temperature: affects cross-entropy loss shape for SPSA
+        X_mean = X.mean(dim=0)
+        Y_mean = torch.zeros(num_classes, device=device)
+        Y_mean.scatter_add_(0, y, torch.ones(y.size(0), device=device))
+        Y_mean /= y.size(0)
+        bias = Y_mean - X_mean @ best_W
+
+        logits_raw = X @ best_W + bias
+        best_loss = float("inf")
+        best_T = 1.0
+
+        for T in [1.0, 5.0, 10.0, 20.0, 50.0]:
+            loss = nn.functional.cross_entropy(logits_raw * T, y).item()
+            if loss < best_loss:
+                best_loss = loss
+                best_T = T
+
+        # Apply best temperature
+        W_final = best_W * best_T
+        bias_final = bias * best_T
 
         fc_device = self.model.fc.weight.device
         with torch.no_grad():
-            self.model.fc.weight.data.copy_(W.T.to(fc_device))  
-            self.model.fc.bias.data.copy_(bias.to(fc_device))   
+            self.model.fc.weight.data.copy_(W_final.T.to(fc_device))
+            self.model.fc.bias.data.copy_(bias_final.to(fc_device))
+
+        # Free GPU memory
+        del X, y, all_feats, all_labels, XtX, XtY, backbone
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
             
     # ------------------------------------------------------------------
     # Internal helpers — students may modify these.

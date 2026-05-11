@@ -62,8 +62,8 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 0.005,
-        eps: float = 0.001,
+        lr: float = 0.05,
+        eps: float = 0.01,
         perturbation_mode: str = "gaussian",
     ) -> None:
         self.model = model
@@ -87,9 +87,65 @@ class ZeroOrderOptimizer:
         # You can also update self.layer_names inside .step() to implement
         # a dynamic schedule (e.g. gradually unfreeze deeper layers).
         # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.layer_names: list[str] = ["fc.bias"]
+        self._init_prototypes()
         # ------------------------------------------------------------------
 
+    def _init_prototypes(self):
+        """Set fc.weight to L2-normalized class centroids from backbone features.
+
+        Using a balanced subset (50 images per class) for speed.
+        Raw centroids have ||c|| ≈ 45, producing dot products ~2000
+        and softmax overflow. L2 normalization keeps logits in [-25, 25].
+        """
+        import torchvision.datasets as datasets
+        import torchvision.transforms as T
+        from torch.utils.data import DataLoader, Subset
+        from collections import defaultdict
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        backbone = nn.Sequential(*list(self.model.children())[:-1])
+        backbone.eval()
+        backbone.to(device)
+
+        transform = T.Compose([
+            T.Resize(224),
+            T.ToTensor(),
+            T.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ])
+
+        full_dataset = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform)
+
+        class_indices = defaultdict(list)
+        for idx, (_, label) in enumerate(full_dataset): class_indices[label].append(idx)
+
+        selected = []
+        for cls in range(100): selected.extend(class_indices[cls][:50])
+
+        subset = Subset(full_dataset, selected)
+        loader = DataLoader(subset, batch_size=256, shuffle=False, num_workers=0)
+        feat_dim = self.model.fc.in_features
+        feat_sums = torch.zeros(100, feat_dim, device=device)
+        counts = torch.zeros(100, device=device)
+
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                feats = backbone(images).flatten(1)
+                feat_sums.index_add_(0, labels, feats)
+                counts.index_add_(0, labels,torch.ones(labels.size(0), device=device))
+        centroids = feat_sums / counts.unsqueeze(1)
+
+        norms = centroids.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        centroids = centroids / norms
+
+        fc_device = self.model.fc.weight.device
+        with torch.no_grad():
+            self.model.fc.weight.data.copy_(centroids.to(fc_device))
+            self.model.fc.bias.data.zero_()
+            
     # ------------------------------------------------------------------
     # Internal helpers — students may modify these.
     # ------------------------------------------------------------------

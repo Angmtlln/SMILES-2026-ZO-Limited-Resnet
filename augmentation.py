@@ -39,27 +39,16 @@ def get_transforms(train: bool) -> T.Compose:
         *after* (tensor-level ops such as ``T.RandomErasing``).
     """
     if train:
-        return T.Compose(
-            [
-                # ----------------------------------------------------------
-                # STUDENT: Extend the training pipeline below.
-                # Keep the Resize and Normalize steps; add augmentations
-                # between or around them as appropriate.
-                # ----------------------------------------------------------
-                T.Resize(224),
-                T.RandomHorizontalFlip(),
-                # Add more augmentations here ↓
-                T.ToTensor(),
-                T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
-                # ----------------------------------------------------------
-            ]
-        )
+        return T.Compose([
+            T.Resize(224),
+            T.RandomHorizontalFlip(p=0.5),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.ToTensor(),
+            T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
+        ])
     else:
-        # Fixed validation pipeline — do not modify.
-        return T.Compose(
-            [
-                T.Resize(224),
-                T.ToTensor(),
-                T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
-            ]
-        )
+        return T.Compose([
+            T.Resize(224),
+            T.ToTensor(),
+            T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
+        ])
